@@ -1,6 +1,6 @@
 # ===================================================================
 # BOT DE TRADING AUTOMATIZADO - MAX WAY STRATEGIES
-# Version: 2.0 - Full Automation + Replit Compatible
+# Version: 3.0 - Compatible con alpaca-py (Nueva API)
 # ===================================================================
 
 import streamlit as st
@@ -11,16 +11,18 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import time
 import threading
-import os
 from collections import deque
 
-# Importar Alpaca (se instalará automáticamente)
+# Importar Alpaca nueva API
 try:
-    import alpaca_trade_api as tradeapi
+    from alpaca.trading.client import TradingClient
+    from alpaca.trading.requests import MarketOrderRequest
+    from alpaca.trading.enums import OrderSide, TimeInForce
+    from alpaca.data.historical import StockHistoricalDataClient
+    from alpaca.data.requests import StockBarsRequest
+    from alpaca.data.timeframe import TimeFrame
 except:
-    st.error("Instalando Alpaca Trade API...")
-    os.system("pip install alpaca-trade-api")
-    import alpaca_trade_api as tradeapi
+    st.error("Instalando Alpaca API...")
 
 # ===================================================================
 # CONFIGURACIÓN
@@ -42,7 +44,8 @@ class AutomatedTradingBot:
         self.api_key = api_key
         self.api_secret = api_secret
         self.paper = paper
-        self.api = None
+        self.trading_client = None
+        self.data_client = None
         self.is_running = False
         self.current_position = None
         self.trades_history = []
@@ -54,7 +57,7 @@ class AutomatedTradingBot:
         self.timeframe = "15Min"
         self.strategy = "ORB"
         self.capital = 10000
-        self.risk_per_trade = 0.02  # 2%
+        self.risk_per_trade = 0.02
         self.trailing_stop_mult = 2.0
         self.take_profit_mult = 3.0
         
@@ -65,9 +68,9 @@ class AutomatedTradingBot:
         self.position_size = 0
         
         if api_key and api_secret:
-            base_url = 'https://paper-api.alpaca.markets' if paper else 'https://api.alpaca.markets'
             try:
-                self.api = tradeapi.REST(api_key, api_secret, base_url, api_version='v2')
+                self.trading_client = TradingClient(api_key, api_secret, paper=paper)
+                self.data_client = StockHistoricalDataClient(api_key, api_secret)
                 self.log("✅ Conectado a Alpaca", "success")
             except Exception as e:
                 self.log(f"❌ Error de conexión: {str(e)}", "error")
@@ -84,7 +87,7 @@ class AutomatedTradingBot:
     def get_account_info(self):
         """Obtiene información de la cuenta"""
         try:
-            account = self.api.get_account()
+            account = self.trading_client.get_account()
             return {
                 'cash': float(account.cash),
                 'portfolio_value': float(account.portfolio_value),
@@ -95,14 +98,17 @@ class AutomatedTradingBot:
             self.log(f"Error obteniendo cuenta: {str(e)}", "error")
             return None
     
-    def get_current_price(self, symbol):
-        """Obtiene el precio actual"""
-        try:
-            quote = self.api.get_latest_trade(symbol)
-            return quote.price
-        except Exception as e:
-            self.log(f"Error obteniendo precio: {str(e)}", "error")
-            return None
+    def get_timeframe_enum(self, tf_string):
+        """Convierte string de timeframe a enum"""
+        mapping = {
+            "1Min": TimeFrame.Minute,
+            "5Min": TimeFrame(5, "Min"),
+            "15Min": TimeFrame(15, "Min"),
+            "1Hour": TimeFrame.Hour,
+            "4Hour": TimeFrame(4, "Hour"),
+            "1Day": TimeFrame.Day
+        }
+        return mapping.get(tf_string, TimeFrame(15, "Min"))
     
     def get_historical_data(self, symbol, timeframe='15Min', limit=100):
         """Obtiene datos históricos"""
@@ -110,21 +116,41 @@ class AutomatedTradingBot:
             end = datetime.now()
             start = end - timedelta(days=7)
             
-            barset = self.api.get_bars(
-                symbol,
-                timeframe,
-                start=start.isoformat(),
-                end=end.isoformat(),
+            request_params = StockBarsRequest(
+                symbol_or_symbols=symbol,
+                timeframe=self.get_timeframe_enum(timeframe),
+                start=start,
+                end=end,
                 limit=limit
-            ).df
+            )
             
-            return barset
+            bars = self.data_client.get_stock_bars(request_params)
+            df = bars.df
+            
+            if isinstance(df.index, pd.MultiIndex):
+                df = df.reset_index(level=0, drop=True)
+            
+            return df
         except Exception as e:
             self.log(f"Error obteniendo datos: {str(e)}", "error")
             return None
     
+    def get_current_price(self, symbol):
+        """Obtiene el precio actual"""
+        try:
+            df = self.get_historical_data(symbol, self.timeframe, limit=1)
+            if df is not None and len(df) > 0:
+                return float(df['close'].iloc[-1])
+            return None
+        except Exception as e:
+            self.log(f"Error obteniendo precio: {str(e)}", "error")
+            return None
+    
     def calculate_atr(self, df, period=14):
-        """Calcula ATR para stop loss dinámico"""
+        """Calcula ATR"""
+        if len(df) < period:
+            return 0
+        
         high = df['high']
         low = df['low']
         close = df['close']
@@ -139,53 +165,45 @@ class AutomatedTradingBot:
         return atr.iloc[-1] if len(atr) > 0 else 0
     
     # ===============================================================
-    # ESTRATEGIAS DE TRADING
+    # ESTRATEGIAS
     # ===============================================================
     
     def check_orb_signal(self, df):
-        """Estrategia ORB - Opening Range Breakout"""
+        """ORB Strategy"""
         if len(df) < 2:
             return 0
         
-        # High y Low de la primera barra (15 min)
         orb_high = df['high'].iloc[0]
         orb_low = df['low'].iloc[0]
         current_price = df['close'].iloc[-1]
         prev_price = df['close'].iloc[-2]
         
-        # Señal de compra: rompe el high
         if prev_price <= orb_high and current_price > orb_high:
             return 1
-        
-        # Señal de venta: rompe el low
         elif prev_price >= orb_low and current_price < orb_low:
             return -1
         
         return 0
     
     def check_pivot_signal(self, df, window=20):
-        """Estrategia Pivot Hunter"""
+        """Pivot Hunter"""
         if len(df) < window * 2:
             return 0
         
-        # Encontrar último pivot high y low
         pivot_high = df['high'].iloc[-window*2:-window].max()
         pivot_low = df['low'].iloc[-window*2:-window].min()
         current_price = df['close'].iloc[-1]
         prev_price = df['close'].iloc[-2]
         
-        # Ruptura de resistencia
         if prev_price <= pivot_high and current_price > pivot_high:
             return 1
-        
-        # Ruptura de soporte
         elif prev_price >= pivot_low and current_price < pivot_low:
             return -1
         
         return 0
     
     def check_gap_signal(self, df, threshold=0.5):
-        """Estrategia Gap Trading"""
+        """Gap Trading"""
         if len(df) < 2:
             return 0
         
@@ -202,53 +220,45 @@ class AutomatedTradingBot:
         return 0
     
     def check_quantum_signal(self, df, rsi_period=14):
-        """Estrategia Quantum Shift"""
+        """Quantum Shift"""
         if len(df) < rsi_period + 20:
             return 0
         
-        # Calcular RSI
         delta = df['close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=rsi_period).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=rsi_period).mean()
         rs = gain / loss
         rsi = 100 - (100 / (1 + rs))
         
-        # Volumen promedio
         vol_ma = df['volume'].rolling(window=20).mean()
         vol_ratio = df['volume'].iloc[-1] / vol_ma.iloc[-1]
         
         current_rsi = rsi.iloc[-1]
         
-        # Sobreventa + volumen alto
         if current_rsi < 30 and vol_ratio > 1.5:
             return 1
-        
-        # Sobrecompra + volumen alto
         elif current_rsi > 70 and vol_ratio > 1.5:
             return -1
         
         return 0
     
     def check_trendshift_signal(self, df, fast=9, slow=21):
-        """Estrategia TrendShift"""
+        """TrendShift"""
         if len(df) < slow + 5:
             return 0
         
         ema_fast = df['close'].ewm(span=fast, adjust=False).mean()
         ema_slow = df['close'].ewm(span=slow, adjust=False).mean()
         
-        # Golden cross
         if ema_fast.iloc[-2] <= ema_slow.iloc[-2] and ema_fast.iloc[-1] > ema_slow.iloc[-1]:
             return 1
-        
-        # Death cross
         elif ema_fast.iloc[-2] >= ema_slow.iloc[-2] and ema_fast.iloc[-1] < ema_slow.iloc[-1]:
             return -1
         
         return 0
     
     def get_signal(self, df):
-        """Obtiene señal según la estrategia seleccionada"""
+        """Obtiene señal según estrategia"""
         if self.strategy == "ORB":
             return self.check_orb_signal(df)
         elif self.strategy == "Pivot Hunter":
@@ -266,7 +276,7 @@ class AutomatedTradingBot:
     # ===============================================================
     
     def calculate_position_size(self, price, atr):
-        """Calcula el tamaño de posición basado en riesgo"""
+        """Calcula tamaño de posición"""
         account = self.get_account_info()
         if not account:
             return 0
@@ -278,22 +288,21 @@ class AutomatedTradingBot:
             return 0
         
         shares = int(risk_amount / stop_distance)
-        
-        # Máximo 10% del capital en una posición
         max_shares = int(account['equity'] * 0.1 / price)
         
-        return min(shares, max_shares)
+        return min(shares, max_shares, 1)  # Mínimo 1 share
     
     def place_order(self, symbol, qty, side):
-        """Coloca una orden en Alpaca"""
+        """Coloca orden"""
         try:
-            order = self.api.submit_order(
+            order_data = MarketOrderRequest(
                 symbol=symbol,
                 qty=qty,
-                side=side,
-                type='market',
-                time_in_force='day'
+                side=OrderSide.BUY if side == "buy" else OrderSide.SELL,
+                time_in_force=TimeInForce.DAY
             )
+            
+            order = self.trading_client.submit_order(order_data)
             self.log(f"✅ Orden ejecutada: {side} {qty} {symbol}", "success")
             return order
         except Exception as e:
@@ -301,7 +310,7 @@ class AutomatedTradingBot:
             return None
     
     def open_position(self, signal, price, atr):
-        """Abre una nueva posición"""
+        """Abre posición"""
         qty = self.calculate_position_size(price, atr)
         
         if qty == 0:
@@ -319,11 +328,10 @@ class AutomatedTradingBot:
                 'entry_time': datetime.now()
             }
             
-            # Calcular stops
-            if signal == 1:  # LONG
+            if signal == 1:
                 self.stop_loss = price - (atr * self.trailing_stop_mult)
                 self.take_profit = price + (atr * self.take_profit_mult)
-            else:  # SHORT
+            else:
                 self.stop_loss = price + (atr * self.trailing_stop_mult)
                 self.take_profit = price - (atr * self.take_profit_mult)
             
@@ -331,7 +339,7 @@ class AutomatedTradingBot:
             self.log(f"   Stop: ${self.stop_loss:.2f} | TP: ${self.take_profit:.2f}", "info")
     
     def update_trailing_stop(self, current_price, atr):
-        """Actualiza el trailing stop"""
+        """Actualiza trailing stop"""
         if not self.current_position:
             return
         
@@ -339,16 +347,15 @@ class AutomatedTradingBot:
             new_stop = current_price - (atr * self.trailing_stop_mult)
             if new_stop > self.stop_loss:
                 self.stop_loss = new_stop
-                self.log(f"📈 Trailing stop actualizado: ${self.stop_loss:.2f}", "info")
-        
-        else:  # SHORT
+                self.log(f"📈 Trailing stop: ${self.stop_loss:.2f}", "info")
+        else:
             new_stop = current_price + (atr * self.trailing_stop_mult)
             if new_stop < self.stop_loss:
                 self.stop_loss = new_stop
-                self.log(f"📉 Trailing stop actualizado: ${self.stop_loss:.2f}", "info")
+                self.log(f"📉 Trailing stop: ${self.stop_loss:.2f}", "info")
     
     def close_position(self, reason, current_price):
-        """Cierra la posición actual"""
+        """Cierra posición"""
         if not self.current_position:
             return
         
@@ -358,7 +365,6 @@ class AutomatedTradingBot:
         order = self.place_order(self.symbol, qty, side)
         
         if order:
-            # Calcular profit
             if self.current_position['type'] == 'LONG':
                 profit = current_price - self.current_position['entry_price']
             else:
@@ -367,7 +373,6 @@ class AutomatedTradingBot:
             profit_pct = (profit / self.current_position['entry_price']) * 100
             profit_usd = profit * qty
             
-            # Guardar trade
             self.trades_history.append({
                 'entry_time': self.current_position['entry_time'],
                 'exit_time': datetime.now(),
@@ -381,52 +386,43 @@ class AutomatedTradingBot:
             })
             
             emoji = "💰" if profit_usd > 0 else "💸"
-            self.log(f"{emoji} Posición cerrada: {reason}", "success" if profit_usd > 0 else "error")
+            self.log(f"{emoji} Cerrado: {reason}", "success" if profit_usd > 0 else "error")
             self.log(f"   P/L: ${profit_usd:.2f} ({profit_pct:+.2f}%)", "info")
             
             self.current_position = None
-            self.stop_loss = 0
-            self.take_profit = 0
     
     def check_exit_conditions(self, current_price):
-        """Verifica condiciones de salida"""
+        """Verifica salidas"""
         if not self.current_position:
             return
         
         if self.current_position['type'] == 'LONG':
-            # Stop loss
             if current_price <= self.stop_loss:
                 self.close_position("Stop Loss", current_price)
-            # Take profit
             elif current_price >= self.take_profit:
                 self.close_position("Take Profit", current_price)
-        
-        else:  # SHORT
-            # Stop loss
+        else:
             if current_price >= self.stop_loss:
                 self.close_position("Stop Loss", current_price)
-            # Take profit
             elif current_price <= self.take_profit:
                 self.close_position("Take Profit", current_price)
     
     # ===============================================================
-    # LOOP PRINCIPAL DEL BOT
+    # LOOP PRINCIPAL
     # ===============================================================
     
     def trading_loop(self):
-        """Loop principal que monitorea y ejecuta trades"""
-        self.log("🤖 Bot iniciado en modo automático", "success")
+        """Loop principal"""
+        self.log("🤖 Bot iniciado", "success")
         
         while self.is_running:
             try:
-                # Verificar horario de mercado
-                clock = self.api.get_clock()
+                clock = self.trading_client.get_clock()
                 if not clock.is_open:
-                    self.log("⏰ Mercado cerrado, esperando...", "warning")
+                    self.log("⏰ Mercado cerrado", "warning")
                     time.sleep(60)
                     continue
                 
-                # Obtener datos actuales
                 df = self.get_historical_data(self.symbol, self.timeframe)
                 if df is None or len(df) == 0:
                     time.sleep(30)
@@ -439,34 +435,29 @@ class AutomatedTradingBot:
                 
                 atr = self.calculate_atr(df)
                 
-                # Actualizar equity
                 account = self.get_account_info()
                 if account:
                     self.equity_history.append(account['equity'])
                 
-                # Si tenemos posición, verificar salida
                 if self.current_position:
                     self.check_exit_conditions(current_price)
                     self.update_trailing_stop(current_price, atr)
-                
-                # Si no tenemos posición, buscar entrada
                 else:
                     signal = self.get_signal(df)
                     if signal != 0:
-                        self.log(f"🎯 Señal detectada: {'COMPRA' if signal == 1 else 'VENTA'}", "info")
+                        self.log(f"🎯 Señal: {'COMPRA' if signal == 1 else 'VENTA'}", "info")
                         self.open_position(signal, current_price, atr)
                 
-                # Esperar antes del próximo ciclo
-                time.sleep(30)  # Revisa cada 30 segundos
+                time.sleep(30)
                 
             except Exception as e:
-                self.log(f"❌ Error en loop: {str(e)}", "error")
+                self.log(f"❌ Error: {str(e)}", "error")
                 time.sleep(60)
         
         self.log("🛑 Bot detenido", "warning")
     
     def start(self):
-        """Inicia el bot en un thread separado"""
+        """Inicia bot"""
         if not self.is_running:
             self.is_running = True
             thread = threading.Thread(target=self.trading_loop, daemon=True)
@@ -475,9 +466,8 @@ class AutomatedTradingBot:
         return False
     
     def stop(self):
-        """Detiene el bot"""
+        """Detiene bot"""
         self.is_running = False
-        # Cerrar posición si existe
         if self.current_position:
             price = self.get_current_price(self.symbol)
             if price:
@@ -488,11 +478,9 @@ class AutomatedTradingBot:
 # ===================================================================
 
 def main():
-    # Título
-    st.title("🤖 Max Way Bot - LIVE TRADING")
-    st.markdown("### Bot Automatizado con Estrategias de Big Daddy Max")
+    st.title("🤖 Max Way Bot - LIVE")
+    st.markdown("### Bot Automatizado con Alpaca")
     
-    # Inicializar bot en session state
     if 'bot' not in st.session_state:
         st.session_state.bot = None
         st.session_state.bot_running = False
@@ -503,13 +491,21 @@ def main():
         
         # API Keys
         st.subheader("🔑 Alpaca API")
-        api_key = st.text_input("API Key", type="password", key="api_key")
-        api_secret = st.text_input("API Secret", type="password", key="api_secret")
+        
+        # Intentar leer desde secrets
+        try:
+            api_key = st.secrets["alpaca"]["api_key"]
+            api_secret = st.secrets["alpaca"]["api_secret"]
+            st.success("✅ Keys desde secrets")
+        except:
+            api_key = st.text_input("API Key", type="password")
+            api_secret = st.text_input("API Secret", type="password")
+        
         paper_trading = st.checkbox("Paper Trading", value=True)
         
         st.divider()
         
-        # Configuración del bot
+        # Estrategia
         st.subheader("🎯 Estrategia")
         strategy = st.selectbox(
             "Estrategia",
@@ -521,11 +517,11 @@ def main():
         
         st.divider()
         
-        # Risk Management
+        # Risk
         st.subheader("💰 Risk Management")
-        risk_pct = st.slider("Riesgo por Trade (%)", 1, 5, 2) / 100
-        trailing_mult = st.slider("Trailing Stop (ATR)", 1.0, 4.0, 2.0, 0.5)
-        tp_mult = st.slider("Take Profit (ATR)", 1.0, 5.0, 3.0, 0.5)
+        risk_pct = st.slider("Riesgo (%)", 1, 5, 2) / 100
+        trailing_mult = st.slider("Trailing Stop", 1.0, 4.0, 2.0, 0.5)
+        tp_mult = st.slider("Take Profit", 1.0, 5.0, 3.0, 0.5)
         
         st.divider()
         
@@ -546,8 +542,9 @@ def main():
                     if st.session_state.bot.start():
                         st.session_state.bot_running = True
                         st.success("✅ Bot iniciado!")
+                        st.rerun()
                 else:
-                    st.error("⚠️ Ingresa tus API keys")
+                    st.error("⚠️ Ingresa API keys")
         
         with col2:
             if st.button("⏹️ DETENER", use_container_width=True):
@@ -555,12 +552,13 @@ def main():
                     st.session_state.bot.stop()
                     st.session_state.bot_running = False
                     st.warning("🛑 Bot detenido")
+                    st.rerun()
     
     # Main area
     if st.session_state.bot and st.session_state.bot_running:
         bot = st.session_state.bot
         
-        # Status indicator
+        # Status
         st.markdown(f"""
         <div style="background: linear-gradient(90deg, #00ff00 0%, #00cc00 100%); 
                     padding: 10px; border-radius: 10px; text-align: center; margin-bottom: 20px;">
@@ -576,16 +574,15 @@ def main():
             with col1:
                 st.metric("💵 Balance", f"${account['equity']:,.2f}")
             with col2:
-                position_status = "LONG" if bot.current_position and bot.current_position['type'] == 'LONG' else "SHORT" if bot.current_position else "Sin posición"
-                st.metric("📊 Posición", position_status)
+                pos = "LONG" if bot.current_position and bot.current_position['type'] == 'LONG' else "SHORT" if bot.current_position else "Sin posición"
+                st.metric("📊 Posición", pos)
             with col3:
-                total_trades = len(bot.trades_history)
-                st.metric("📈 Trades", total_trades)
+                st.metric("📈 Trades", len(bot.trades_history))
             with col4:
                 if bot.trades_history:
-                    winning = len([t for t in bot.trades_history if t['profit'] > 0])
-                    win_rate = (winning / total_trades * 100)
-                    st.metric("🎯 Win Rate", f"{win_rate:.1f}%")
+                    wins = len([t for t in bot.trades_history if t['profit'] > 0])
+                    wr = (wins / len(bot.trades_history) * 100)
+                    st.metric("🎯 Win Rate", f"{wr:.1f}%")
                 else:
                     st.metric("🎯 Win Rate", "0%")
         
@@ -593,21 +590,17 @@ def main():
         tab1, tab2, tab3 = st.tabs(["📊 Dashboard", "📜 Logs", "💼 Trades"])
         
         with tab1:
-            # Equity curve
             if len(bot.equity_history) > 1:
-                st.subheader("📈 Curva de Capital")
                 fig = go.Figure()
                 fig.add_trace(go.Scatter(
                     y=list(bot.equity_history),
                     mode='lines',
-                    name='Equity',
-                    line=dict(color='#00ff00', width=2),
-                    fill='tozeroy'
+                    fill='tozeroy',
+                    line=dict(color='#00ff00', width=2)
                 ))
-                fig.update_layout(height=300, template="plotly_dark")
+                fig.update_layout(height=300, template="plotly_dark", title="Equity Curve")
                 st.plotly_chart(fig, use_container_width=True)
             
-            # Posición actual
             if bot.current_position:
                 st.subheader("📍 Posición Actual")
                 col1, col2, col3 = st.columns(3)
@@ -616,90 +609,75 @@ def main():
                     st.info(f"""
                     **Tipo:** {bot.current_position['type']}  
                     **Entrada:** ${bot.current_position['entry_price']:.2f}  
-                    **Cantidad:** {bot.current_position['qty']} shares
+                    **Cantidad:** {bot.current_position['qty']}
                     """)
                 
                 with col2:
-                    current_price = bot.get_current_price(bot.symbol)
-                    if current_price:
+                    cp = bot.get_current_price(bot.symbol)
+                    if cp:
                         if bot.current_position['type'] == 'LONG':
-                            pnl = (current_price - bot.current_position['entry_price']) * bot.current_position['qty']
+                            pnl = (cp - bot.current_position['entry_price']) * bot.current_position['qty']
                         else:
-                            pnl = (bot.current_position['entry_price'] - current_price) * bot.current_position['qty']
+                            pnl = (bot.current_position['entry_price'] - cp) * bot.current_position['qty']
                         
                         color = "green" if pnl > 0 else "red"
                         st.markdown(f"""
-                        **Precio Actual:** ${current_price:.2f}  
+                        **Precio:** ${cp:.2f}  
                         **P/L:** <span style="color: {color};">${pnl:.2f}</span>
                         """, unsafe_allow_html=True)
                 
                 with col3:
                     st.warning(f"""
-                    **Stop Loss:** ${bot.stop_loss:.2f}  
-                    **Take Profit:** ${bot.take_profit:.2f}
+                    **Stop:** ${bot.stop_loss:.2f}  
+                    **TP:** ${bot.take_profit:.2f}
                     """)
         
         with tab2:
-            st.subheader("📜 Logs en Tiempo Real")
-            
-            # Mostrar logs
-            logs_container = st.container()
-            with logs_container:
-                for log in reversed(list(bot.logs)):
-                    color = {
-                        'success': 'green',
-                        'error': 'red',
-                        'warning': 'orange',
-                        'info': 'blue'
-                    }.get(log['level'], 'white')
-                    
-                    st.markdown(f"""
-                    <div style="background: rgba(0,0,0,0.3); padding: 8px; margin: 4px 0; border-radius: 5px; border-left: 3px solid {color};">
-                        <span style="color: gray;">[{log['time']}]</span> {log['message']}
-                    </div>
-                    """, unsafe_allow_html=True)
+            st.subheader("📜 Logs")
+            for log in reversed(list(bot.logs)):
+                color = {'success': 'green', 'error': 'red', 'warning': 'orange', 'info': 'blue'}.get(log['level'], 'white')
+                st.markdown(f"""
+                <div style="background: rgba(0,0,0,0.3); padding: 8px; margin: 4px 0; border-radius: 5px; border-left: 3px solid {color};">
+                    [{log['time']}] {log['message']}
+                </div>
+                """, unsafe_allow_html=True)
         
         with tab3:
-            st.subheader("💼 Historial de Trades")
-            
+            st.subheader("💼 Historial")
             if bot.trades_history:
-                df_trades = pd.DataFrame(bot.trades_history)
-                
-                # Calcular estadísticas
-                total_profit = df_trades['profit'].sum()
-                avg_profit = df_trades['profit'].mean()
-                winning_trades = len(df_trades[df_trades['profit'] > 0])
-                losing_trades = len(df_trades[df_trades['profit'] < 0])
+                df = pd.DataFrame(bot.trades_history)
+                total = df['profit'].sum()
+                avg = df['profit'].mean()
+                wins = len(df[df['profit'] > 0])
+                losses = len(df[df['profit'] < 0])
                 
                 col1, col2, col3, col4 = st.columns(4)
                 with col1:
-                    st.metric("Total P/L", f"${total_profit:.2f}")
+                    st.metric("Total P/L", f"${total:.2f}")
                 with col2:
-                    st.metric("Avg P/L", f"${avg_profit:.2f}")
+                    st.metric("Avg P/L", f"${avg:.2f}")
                 with col3:
-                    st.metric("✅ Wins", winning_trades)
+                    st.metric("✅ Wins", wins)
                 with col4:
-                    st.metric("❌ Losses", losing_trades)
+                    st.metric("❌ Losses", losses)
                 
-                st.dataframe(df_trades, use_container_width=True)
+                st.dataframe(df, use_container_width=True)
             else:
-                st.info("📊 No hay trades ejecutados aún")
+                st.info("No hay trades")
         
-        # Auto-refresh cada 5 segundos
         time.sleep(5)
         st.rerun()
     
     else:
-        # Mensaje inicial
         st.info("""
-        ### 🚀 Bienvenido al Bot Automatizado
+        ### 🚀 Bot de Trading Automatizado
         
         **Para comenzar:**
-        1. Ingresa tus API keys de Alpaca en el sidebar
-        2. Configura tu estrategia y parámetros
-        3. Click en ▶️ INICIAR
+        1. Ingresa tus API keys (o configúralas en Secrets)
+        2. Selecciona estrategia
+        3. Click ▶️ INICIAR
         
-        El bot monitoreará el mercado 24/7 y ejecutará trades automáticamente.
+        El bot operará 24/7 automáticamente.
         """)
 
 if __name__ == "__main__":
